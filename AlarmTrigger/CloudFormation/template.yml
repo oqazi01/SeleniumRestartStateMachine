@@ -83,7 +83,7 @@ Resources:
                   - ec2:DescribeInstanceStatus
                   - ec2:DescribeInstances
                   - ec2:RebootInstances
-                  - ec2:Stop*"
+                  - ec2:Stop*
                   - ec2:Start*
                 Resource: "*"
   StateFailTopic:
