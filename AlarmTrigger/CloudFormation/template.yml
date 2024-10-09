@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  Region:
+    Description: "The AWS region where the resources will be deployed"
+    Type: String
+    Default: "us-east-1"
+    AllowedValues:
+      - us-west-1
+      - us-west-2
+      - us-east-1
+      - us-east-2
+      - eu-west-1
+      - eu-central-1
+    ConstraintDescription: "Must be a valid AWS region."
+
+  S3Bucket:
+    Description: "S3 bucket where Lambda start/stop code is stored"
+    Type: String
+  
+  S3_stop_function_key:
+    Description: "S3 key (file path) for the stop function zip file"
+    Type: String
+    Default: "ec2-status-check-fail-stop-function.zip"
+
+  S3_restart_function_key:
+    Description: "S3 key (file path) for the start function zip file"
+    Type: String
+    Default: "ec2-status-check-fail-restart-function.zip"
+  
+  AlarmNamePrefix:
+    Description: "The alarm name or alarm name prefix (for multiple alarms) to trigger selenium machine restart workflow"
+    Type: String
+    Default: "Selenium-MachineStatusCheckFailAlarm"
+
+
+Resources:
+  # Lambda Function for stopping EC2 instance
+  StopEC2LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties: 
+      FunctionName: instance-stop-function
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.10
+      Code:
+        S3Bucket: !Ref S3Bucket
+        S3Key: !Ref S3_stop_function_key
+  
+  # Lambda Function for restarting EC2 instance
+  RestartEC2LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties: 
+      FunctionName: instance-start-function
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.10
+      Code:
+        S3Bucket: !Ref S3Bucket
+        S3Key: !Ref S3_restart_function_key
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaBasicExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeInstances
+                  - ec2:RebootInstances
+                  - ec2:Stop*"
+                  - ec2:Start*
+                Resource: "*"
+  StateFailTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: SeleniumRestartFailEventTopic
+      DisplayName: "SNS topic for Fail event notifications"
+  # IAM Role for Step Functions
+  StepFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - sns:Publish
+                Resource: "*"
+
+  # Step Function Definition
+  StopStartEC2StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StepFunctionExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "State machine to stop and start EC2 instance based on health check failure",
+          "StartAt": "Stop EC2 Instance",
+          "States": {
+            "Stop EC2 Instance": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:instance-stop-function",
+              "Next": "Wait"
+            },
+            "Wait": {
+              "Type": "Wait",
+              "Seconds": 180,
+              "Next": "Check Instance State"
+            },
+            "Check Instance State": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:instance-start-function",
+              "Next": "Check Stopping State",
+              "ResultPath": "$.instanceState",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 5,
+                  "BackoffRate": 2
+                }
+              ]
+            },
+            "Check Stopping State": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.instanceState.status",
+                  "StringEquals": "stopping",
+                  "Next": "Wait and Retry"
+                },
+                {
+                  "Variable": "$.instanceState.status",
+                  "StringEquals": "running",
+                  "Next": "Stop EC2 Instance"
+                },
+                {
+                  "Variable": "$.instanceState.status",
+                  "StringEquals": "starting",
+                  "Next": "Success"
+                },
+                {
+                  "Variable": "$.instanceState.status",
+                  "StringEquals": "stopped",
+                  "Next": "Start EC2 Instance"
+                }
+              ],
+              "Default": "SNS Publish"
+            },
+            "SNS Publish": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${StateFailTopicArn}",
+                "Message.$": "$"
+              },
+              "Next": "Fail"
+            },
+            "Start EC2 Instance": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:instance-start-function",
+              "Next": "Success"
+            },
+            "Wait and Retry": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "Check Instance State"
+            },
+            "Success": {
+              "Type": "Succeed"
+            },
+            "Fail": {
+              "Type": "Fail",
+              "Cause": "Unknown instance state"
+            }
+          }
+        }
+
+  # EventBridge Rule
+  CloudWatchEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: EC2HealthCheckFailureRule
+      EventPattern:
+        Fn::Sub: >-
+          {"source":["aws.cloudwatch"],"detail-type":["CloudWatch Alarm State
+          Change"],"resources":[{"prefix":"arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AlarmNamePrefix}"}],"detail":{"state":{"value":["ALARM"]}}}
+      Targets:
+        - Arn: !GetAtt StopStartEC2StateMachine.Arn
+          Id: "StepFunctionTarget"
+      RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+  
+  # IAM Role for EventBridge to Invoke Step Function
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeInvokeStepFunctionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "states:StartExecution"
+                Resource: !GetAtt StopStartEC2StateMachine.Arn
+Outputs:
+  StateFailTopicArn:
+    Description: "The ARN of the SNS topic for Fail event notifications."
+    Value: !Ref StateFailTopic
